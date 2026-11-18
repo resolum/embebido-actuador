@@ -17,7 +17,9 @@
  *   - Placa ESP32 Dev Module (ESP32 clasico), core esp32 de Espressif 3.x.
  *   - Librerias: ModestIoT (libraries/ModestIoT del repo), ArduinoJson 7.x, WebSockets 2.7.x, ESP32Servo y las demas de ModestIoT.
  *   - Servos: alimentalos con una fuente externa de 5 V (1 A o mas) con la tierra COMUN con el ESP32. Nunca desde el pin 3V3.
- *   - Monitor serie a 115200: "s" estado, "t <canal> <accion>" prueba local (ej. "t 0 open"), "h" ayuda.
+ *   - Monitor serie a 115200: "s" estado, "t <canal> <accion>" prueba local (ej. "t 0 open"), "b <0-100>" simula la
+ *     bateria (b off la vuelve a leer), "h" ayuda.
+ *   - Bateria (opcional): divisor de voltaje en BATTERY_PIN; se envia en {"type":"telemetry"} cada minuto.
  *
  * Sin el dispositivo: tools/fake_embebido.py del edge de actuadores hace de este ESP32 (mismo protocolo).
  */
@@ -47,6 +49,12 @@ static constexpr unsigned long SERIAL_BAUD_RATE = 115200;
 // ---------------------------------------------------------------------------
 static constexpr uint8_t CHANNELS = 4;
 static const int SERVO_PINS[CHANNELS] = {13, 16, 17, 18};
+
+// Bateria (opcional): BAT+ -> 100k -> BATTERY_PIN -> 100k -> GND. -1 = sin bateria (la telemetria sale sin ella).
+// Se informa al edge cada TELEMETRY_INTERVAL_MS; el edge avisa al familiar cuando baja del 20 %. Ver BatteryMonitor.h.
+static constexpr int   BATTERY_PIN            = 35;
+static constexpr float BATTERY_DIVIDER_RATIO  = 2.0f;
+static constexpr unsigned long TELEMETRY_INTERVAL_MS = 60000;
 
 // MAC logica fija por canal (opcional). nullptr = derivarla de la MAC base.
 static const char* const MAC_OVERRIDE[CHANNELS] = {nullptr, nullptr, nullptr, nullptr};
@@ -89,7 +97,9 @@ WebSocketGatewayClient edgeLink(connectivity, EDGE_HOST, EDGE_PORT, EDGE_PATH, l
 
 alivia::ServoBank servoBank(SERVO_PINS, channelConfigs, CHANNELS);
 alivia::ActuatorLogic actuatorLogic(channelConfigs, CHANNELS, servoBank);
-alivia::ActuatorNode actuatorNode(edgeLink, actuatorLogic, channelConfigs, CHANNELS, FIRMWARE);
+alivia::BatteryMonitor batteryMonitor(BATTERY_PIN, BATTERY_DIVIDER_RATIO);
+alivia::ActuatorNode actuatorNode(edgeLink, actuatorLogic, channelConfigs, CHANNELS, FIRMWARE, batteryMonitor,
+                                  TELEMETRY_INTERVAL_MS);
 
 static void printStatus() {
     char base[18];
@@ -109,6 +119,15 @@ static void handleSerial() {
     if (line.length() == 0) return;
     if (line == "s") {
         printStatus();
+    } else if (line == "b" || line.startsWith("b ")) {
+        const String value = line.length() > 2 ? line.substring(2) : String("");
+        if (value == "off" || value.length() == 0) {
+            actuatorNode.simulateBattery(-1);
+            SerialConsole::printf("[Bateria] sin simulacion: se lee el pin %d\n", BATTERY_PIN);
+        } else {
+            actuatorNode.simulateBattery(value.toInt());
+            SerialConsole::printf("[Bateria] simulando %d %% (se envia al edge ahora)\n", batteryMonitor.simulatedPercent());
+        }
     } else if (line.startsWith("t ")) {
         const int space = line.indexOf(' ', 2);
         if (space < 0) {
@@ -120,7 +139,8 @@ static void handleSerial() {
         action.trim();
         actuatorNode.submitLocal(channel, action.c_str());
     } else {
-        SerialConsole::printf("Comandos: s estado | t <canal> <open|close|on|off> prueba local sin edge (ej. t 0 open)\n");
+        SerialConsole::printf("Comandos: s estado | t <canal> <open|close|on|off> prueba local sin edge (ej. t 0 open) | "
+                              "b <0-100> simula la bateria, b off la vuelve a leer\n");
     }
 }
 
@@ -130,6 +150,7 @@ void setup() {
     SerialConsole::printf("\n=== Alivia Actuators | ESP32 con 4 servos | ModestIoT ===\n");
     configureChannels();
     servoBank.begin();  // lleva cada servo a su angulo de cerrado/apagado
+    batteryMonitor.begin();
     printStatus();
     SerialConsole::printf("Registra en el backend una MAC por dispositivo (DOOR, WINDOW, CURTAIN, LIGHT) con las MAC de arriba.\n");
 #if USE_BLUETOOTH
