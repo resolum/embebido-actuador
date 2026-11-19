@@ -7,6 +7,7 @@
 
 #include "ActuatorLogic.h"
 #include "ActuatorProtocol.h"
+#include "BatteryMonitor.h"
 
 namespace alivia {
 
@@ -34,8 +35,10 @@ private:
 class ActuatorNode : public LinkProtocolDelegate {
 public:
     ActuatorNode(StreamGatewayClient& edgeLink, ActuatorLogic& actuatorLogic, const ChannelConfig* channelConfigs,
-                 uint8_t channelCount, const char* firmwareVersion)
-        : link(edgeLink), logic(actuatorLogic), channels(channelConfigs), count(channelCount), firmware(firmwareVersion) {}
+                 uint8_t channelCount, const char* firmwareVersion, BatteryMonitor& batteryMonitor,
+                 unsigned long telemetryIntervalMs)
+        : link(edgeLink), logic(actuatorLogic), channels(channelConfigs), count(channelCount), firmware(firmwareVersion),
+          battery(batteryMonitor), telemetryEveryMs(telemetryIntervalMs) {}
 
     bool begin() {
         lock = xSemaphoreCreateMutex();
@@ -45,6 +48,7 @@ public:
     }
 
     void service() {
+        sendTelemetryWhenDue();
         lock_();
         logic.tick(millis());
         unlock_();
@@ -87,12 +91,33 @@ public:
         unlock_();
     }
 
+    /** Envia la telemetria (bateria, memoria, senal) al conectarse y luego cada telemetryEveryMs. */
+    void sendTelemetryWhenDue() {
+        if (!link.isReady()) return;
+        const unsigned long now = millis();
+        if (telemetrySent && now - lastTelemetryMs < telemetryEveryMs) return;
+        char json[192];
+        const BatteryReading reading = battery.read();
+        if (TelemetryBuilder::build(json, sizeof(json), now, ESP.getFreeHeap(), currentRssi(), reading) == 0) return;
+        if (!link.sendText(json)) return;
+        telemetrySent = true;
+        lastTelemetryMs = now;
+        if (reading.present) SerialConsole::printf("[Bateria] %d mV, %d %%\n", reading.millivolts, reading.percent);
+    }
+
+    /** Para probar sin bateria: fija un porcentaje (o -1 para volver a leer el pin) y lo envia de inmediato. */
+    void simulateBattery(int percent) {
+        battery.simulate(percent);
+        telemetrySent = false;
+    }
+
     void fillHello(JsonDocument& hello) override { fillActuatorHello(hello, channels, count, firmware); }
 
     void onLinkReady(JsonDocument& ready) override {
         String text;
         serializeJson(ready["channels"], text);
         SerialConsole::printf("[Actuadores] el edge habilito los canales %s\n", text.c_str());
+        telemetrySent = false;  // cada conexion empieza informando la bateria
     }
 
     void onText(const char* type, JsonDocument& message) override {
@@ -112,11 +137,23 @@ private:
     void lock_() { if (lock != nullptr) xSemaphoreTake(lock, portMAX_DELAY); }
     void unlock_() { if (lock != nullptr) xSemaphoreGive(lock); }
 
+    static int currentRssi() {
+#if defined(USE_BLUETOOTH) && USE_BLUETOOTH
+        return 0;
+#else
+        return WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+#endif
+    }
+
     StreamGatewayClient& link;
     ActuatorLogic& logic;
     const ChannelConfig* channels;
     uint8_t count;
     const char* firmware;
+    BatteryMonitor& battery;
+    unsigned long telemetryEveryMs;
+    unsigned long lastTelemetryMs = 0;
+    bool telemetrySent = false;
     SemaphoreHandle_t lock = nullptr;
     unsigned long localCounter = 0;
 };
